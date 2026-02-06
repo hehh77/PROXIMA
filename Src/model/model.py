@@ -1,0 +1,565 @@
+import gc
+import math
+from typing import Dict, Mapping, Optional, Tuple, Any, Union
+import warnings
+
+import torch
+import numpy as np
+from torch import nn, Tensor
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.distributions import Bernoulli
+from flash_attn.flash_attention import FlashMHA
+from tqdm import trange
+
+from .grad_reverse import grad_reverse
+from .flash_layers import FlashscGPTLayer, FlashscGPTGenerator
+
+
+
+def generate_square_subsequent_mask(sz: int) -> Tensor:
+    """Generates an upper-triangular matrix of -inf, with zeros on diag."""
+    return torch.triu(torch.ones(sz, sz) * float("-inf"), diagonal=1)
+
+
+class FastTransformerEncoderWrapper(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        d_hid: int,
+        nlayers: int,
+        dropout: float = 0.5,
+    ):
+        super().__init__()
+        self.fast_transformer_encoder = self.build_fast_transformer_encoder(
+            d_model, nhead, d_hid, nlayers, dropout
+        )
+
+    @staticmethod
+    def build_fast_transformer_encoder(
+        d_model: int, nhead: int, d_hid: int, nlayers: int, dropout: float
+    ) -> nn.Module:
+
+        from fast_transformers.builders import TransformerEncoderBuilder
+
+        if d_model % nhead != 0:
+            raise ValueError(
+                f"d_model must be divisible by nhead, "
+                f"got d_model={d_model} and nhead={nhead}"
+            )
+        builder = TransformerEncoderBuilder.from_kwargs(
+            n_layers=nlayers,
+            n_heads=nhead,
+            query_dimensions=d_model // nhead,
+            value_dimensions=d_model // nhead,
+            feed_forward_dimensions=d_hid,
+            attention_type="linear",
+            attention_dropout=dropout,
+            dropout=dropout,
+            activation="gelu",
+        )
+        assert builder.attention_type == "linear"
+        return builder.get()
+
+    @staticmethod
+    def build_length_mask(
+        src: Tensor,
+        src_key_padding_mask: torch.BoolTensor,
+    ) -> "LengthMask":
+
+        from fast_transformers.masking import LengthMask
+
+        seq_len = src.shape[1]
+        num_paddings = src_key_padding_mask.sum(dim=1)
+        actual_seq_len = seq_len - num_paddings  # (N,)
+        length_mask = LengthMask(actual_seq_len, max_len=seq_len, device=src.device)
+
+        if src_key_padding_mask[length_mask.bool_matrix].sum() != 0:
+            raise ValueError(
+                "Found padding tokens in the middle of the sequence. "
+                "src_key_padding_mask and length_mask are not compatible."
+            )
+        return length_mask
+
+    def forward(
+        self,
+        src: Tensor,
+        src_key_padding_mask: torch.BoolTensor,
+    ) -> Tensor:
+        """
+        Args:
+            src: Tensor, shape [N, seq_len, embsize]
+            src_key_padding_mask: Tensor, shape [N, seq_len]
+
+        Returns:
+            output Tensor of shape [N, seq_len, embsize]
+        """
+        if src_key_padding_mask.shape != src.shape[:2]:
+            raise ValueError(
+                f"src_key_padding_mask shape {src_key_padding_mask.shape} "
+                f"does not match first two dims of src shape {src.shape[:2]}"
+            )
+
+        if src_key_padding_mask.dtype != torch.bool:
+            raise ValueError(
+                f"src_key_padding_mask needs to be of type torch.bool, "
+                f"got {src_key_padding_mask.dtype}"
+            )
+
+        length_mask = self.build_length_mask(src, src_key_padding_mask)
+        output = self.fast_transformer_encoder(src, length_mask=length_mask)
+        return output
+
+
+class FlashTransformerEncoderLayer(nn.Module):
+    r"""TransformerEncoderLayer is made up of self-attn and feedforward network.
+    The class is modified from torch.nn.TransformerEncoderLayer to support the
+    FlashAttention.
+
+    Args:
+        d_model: the number of expected features in the input (required).
+        nhead: the number of heads in the multiheadattention models (required).
+        dim_feedforward: the dimension of the feedforward network model (default=2048).
+        dropout: the dropout value (default=0.1).
+        activation: the activation function of intermediate layer, relu or gelu (default=relu).
+        layer_norm_eps: the eps value in layer normalization components (default=1e-5).
+        batch_first: If ``True``, then the input and output tensors are provided
+            as (batch, seq, feature). Default: ``False``.
+
+    Examples::
+        >>> encoder_layer = nn.TransformerEncoderLayer(d_model=512, nhead=8)
+        >>> src = torch.rand(10, 32, 512)
+        >>> out = encoder_layer(src)
+
+    Alternatively, when ``batch_first`` is ``True``:
+        >>> encoder_layer = nn.TransformerEncoderLayer(d_model=512, nhead=8, batch_first=True)
+        >>> src = torch.rand(32, 10, 512)
+        >>> out = encoder_layer(src)
+    """
+    __constants__ = ["batch_first"]
+
+    def __init__(
+        self,
+        d_model,
+        nhead,
+        dim_feedforward=2048,
+        dropout=0.1,
+        activation="relu",
+        layer_norm_eps=1e-5,
+        batch_first=True,
+        device=None,
+        dtype=None,
+        norm_scheme="post",  # "pre" or "post"
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.self_attn = FlashMHA(
+            embed_dim=d_model,
+            num_heads=nhead,
+            batch_first=batch_first,
+            attention_dropout=dropout,
+            **factory_kwargs,
+        )
+
+        # Version compatibility workaround
+        if not hasattr(self.self_attn, "batch_first"):
+            self.self_attn.batch_first = batch_first
+
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model, **factory_kwargs)
+
+        self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.activation = self._get_activation_fn(activation)
+        self.norm_scheme = norm_scheme
+        if self.norm_scheme not in ["pre", "post"]:
+            raise ValueError(f"norm_scheme should be pre or post, not {norm_scheme}")
+
+    @staticmethod
+    def _get_activation_fn(activation):
+        if activation == "relu":
+            return F.relu
+        elif activation == "gelu":
+            return F.gelu
+
+        raise RuntimeError("activation should be relu/gelu, not {}".format(activation))
+
+    def __setstate__(self, state):
+        if "activation" not in state:
+            state["activation"] = F.relu
+        super().__setstate__(state)
+
+    def forward(
+        self,
+        src: Tensor,
+        src_mask: Optional[Tensor] = None,
+        src_key_padding_mask: Optional[Tensor] = None,
+        **kwargs,
+    ) -> Tensor:
+        r"""Pass the input through the encoder layer.
+
+        Args:
+            src: the sequence to the encoder layer (required).
+            src_mask: the mask for the src sequence (optional).
+            src_key_padding_mask: the mask for the src keys per batch (optional).
+
+        Shape:
+            see the docs in Transformer class.
+        """
+        if src_mask is not None:
+            raise ValueError("FlashTransformerEncoderLayer does not support src_mask")
+
+        if not src_key_padding_mask.any().item():
+            # no padding tokens in src
+            src_key_padding_mask_ = None
+        else:
+            if src_key_padding_mask.dtype != torch.bool:
+                src_key_padding_mask = src_key_padding_mask.bool()
+            # NOTE: the FlashMHA uses mask 0 for padding tokens, which is the opposite
+            src_key_padding_mask_ = ~src_key_padding_mask
+
+        if self.norm_scheme == "pre":
+            src = self.norm1(src)
+            src2 = self.self_attn(src, key_padding_mask=src_key_padding_mask_)[0]
+            src = src + self.dropout1(src2)
+            src = self.norm2(src)
+            src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+            src = src + self.dropout2(src2)
+        else:
+            src2 = self.self_attn(src, key_padding_mask=src_key_padding_mask_)[0]
+            src = src + self.dropout1(src2)
+            src = self.norm1(src)
+            src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+            src = src + self.dropout2(src2)
+            src = self.norm2(src)
+
+        return src
+
+
+class GeneEncoder(nn.Module):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: Optional[int] = None,
+    ):
+        super().__init__()
+        self.embedding = nn.Embedding(
+            num_embeddings, embedding_dim, padding_idx=padding_idx
+        )
+        self.enc_norm = nn.LayerNorm(embedding_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.embedding(x)  # (batch, seq_len, embsize)
+        x = self.enc_norm(x)
+        return x
+
+
+class ContinuousValueEncoder(nn.Module):
+    """
+    Encode real number values to a vector using neural nets projection.
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_value: int = 512):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        self.linear1 = nn.Linear(1, d_model)
+        self.activation = nn.ReLU()
+        self.linear2 = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.max_value = max_value
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: Tensor, shape [batch_size, seq_len]
+        """
+        # TODO: test using actual embedding layer if input is categorical
+        # expand last dimension
+        x = x.unsqueeze(-1)
+        # clip x to [-inf, max_value]
+        x = torch.clamp(x, max=self.max_value)
+        x = self.activation(self.linear1(x))
+        x = self.linear2(x)
+        x = self.norm(x)
+        return self.dropout(x)
+
+
+class CategoryValueEncoder(nn.Module):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: Optional[int] = None,
+    ):
+        super().__init__()
+        self.embedding = nn.Embedding(
+            num_embeddings, embedding_dim, padding_idx=padding_idx
+        )
+        self.enc_norm = nn.LayerNorm(embedding_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x.long()
+        x = self.embedding(x)  # (batch, seq_len, embsize)
+        x = self.enc_norm(x)
+        return x
+
+
+class BatchLabelEncoder(nn.Module):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: Optional[int] = None,
+    ):
+        super().__init__()
+        self.embedding = nn.Embedding(
+            num_embeddings, embedding_dim, padding_idx=padding_idx
+        )
+        self.enc_norm = nn.LayerNorm(embedding_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.embedding(x)  # (batch, embsize)
+        x = self.enc_norm(x)
+        return x
+
+class ExprDecoder(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        explicit_zero_prob: bool = False,
+        use_batch_labels: bool = False,
+    ):
+        super().__init__()
+        d_in = d_model * 2 if use_batch_labels else d_model
+        self.fc = nn.Sequential(
+            nn.Linear(d_in, d_model),
+            nn.LeakyReLU(),
+            nn.Linear(d_model, d_model),
+            nn.LeakyReLU(),
+            nn.Linear(d_model, 1),
+        )
+        self.explicit_zero_prob = explicit_zero_prob
+        if explicit_zero_prob:
+            self.zero_logit = nn.Sequential(
+                nn.Linear(d_in, d_model),
+                nn.LeakyReLU(),
+                nn.Linear(d_model, d_model),
+                nn.LeakyReLU(),
+                nn.Linear(d_model, 1),
+            )
+
+    def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        """x is the output of the transformer, (batch, seq_len, d_model)"""
+        pred_value = self.fc(x).squeeze(-1)  # (batch, seq_len)
+
+        if not self.explicit_zero_prob:
+            return dict(pred=pred_value)
+        zero_logits = self.zero_logit(x).squeeze(-1)  # (batch, seq_len)
+        zero_probs = torch.sigmoid(zero_logits)
+        return dict(pred=pred_value, zero_probs=zero_probs)
+
+class MoeDecoder(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_experts: int,
+        use_batch_labels: bool = False,
+    ):
+        super().__init__()
+        d_in = d_model * 2 if use_batch_labels else d_model
+        self.moe = MoELayer(d_in, d_model, 1, num_experts)
+
+    def forward(self, x: Tensor, topn: int = 2) -> Dict[str, Tensor]:
+        """x is the output of the transformer, (batch, seq_len, d_model)"""
+        pred_value = self.moe(x, topn).squeeze(-1)
+        return dict(pred=pred_value)
+
+
+class ClsDecoder(nn.Module):
+    """
+    Decoder for classification task.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_cls: int,
+        nlayers: int = 3,
+        activation: callable = nn.ReLU,
+    ):
+        super().__init__()
+        # module list
+        self._decoder = nn.ModuleList()
+        for i in range(nlayers - 1):
+            self._decoder.append(nn.Linear(d_model, d_model))
+            self._decoder.append(activation())
+            self._decoder.append(nn.LayerNorm(d_model))
+        self.out_layer = nn.Linear(d_model, n_cls)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: Tensor, shape [batch_size, embsize]
+        """
+        for layer in self._decoder:
+            x = layer(x)
+        return self.out_layer(x)
+
+
+class MVCDecoder(nn.Module):
+    """
+    Decoder for the masked value prediction for cell embeddings.
+
+    There are actually three ways of making this, all start with gene_embs -> query_vecs,
+    and then:
+    1. cell_emb x W x query vecs.
+       This one makes the most sense, since in the query space, the query look at
+       different dimensions of cel_emb and sync them. This one has explicit interaction.
+    2. FC([cell_emb, query_vecs]).
+       This one has the benifit to have smaller query_vecs and makes them like bottle
+       neck layer. For example 64 dims.
+    3. FC(cell_emb + query_vecs).
+
+    **NOTE**:
+    1. it is important to make gene query vectors directly from the input
+    gene embs. Because have to make sure there is no value information mixed in,
+    and that is the only place to get the raw gene embs.
+    2. Bare in mind to avoid short cut for the model to just predict
+    value form the query. Make sure predict based on the cell_emb.
+    3. Guess it will be better to use sigmoid for the query vecs.
+    4. TODO: Optionally, can even try detach the gene_embs when making query_vec.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        arch_style: str = "inner product",
+        query_activation: nn.Module = nn.Sigmoid,
+        hidden_activation: nn.Module = nn.PReLU,
+        explicit_zero_prob: bool = False,
+        use_batch_labels: bool = False,
+    ) -> None:
+        """
+        Args:
+            d_model (:obj:`int`): dimension of the gene embedding.
+            arch_style (:obj:`str`): architecture style of the decoder, choice from
+                1. "inner product" or 2. "concat query" or 3. "sum query".
+            query_activation (:obj:`nn.Module`): activation function for the query
+                vectors.
+            hidden_activation (:obj:`nn.Module`): activation function for the hidden
+                layers.
+        """
+        super().__init__()
+        d_in = d_model * 2 if use_batch_labels else d_model
+        if arch_style in ["inner product", "inner product, detach"]:
+            self.gene2query = nn.Linear(d_model, d_model)
+            self.query_activation = query_activation()
+            self.W = nn.Linear(d_model, d_in, bias=False)
+            if explicit_zero_prob:  # by default, gene-wise prob rate
+                self.W_zero_logit = nn.Linear(d_model, d_in)
+        elif arch_style == "concat query":
+            self.gene2query = nn.Linear(d_model, 64)
+            self.query_activation = query_activation()
+            self.fc1 = nn.Linear(d_model + 64, 64)
+            self.hidden_activation = hidden_activation()
+            self.fc2 = nn.Linear(64, 1)
+        elif arch_style == "sum query":
+            self.gene2query = nn.Linear(d_model, d_model)
+            self.query_activation = query_activation()
+            self.fc1 = nn.Linear(d_model, 64)
+            self.hidden_activation = hidden_activation()
+            self.fc2 = nn.Linear(64, 1)
+        else:
+            raise ValueError(f"Unknown arch_style: {arch_style}")
+
+        self.arch_style = arch_style
+        self.do_detach = arch_style.endswith("detach")
+        self.explicit_zero_prob = explicit_zero_prob
+
+    def forward(
+        self, cell_emb: Tensor, gene_embs: Tensor
+    ) -> Union[Tensor, Dict[str, Tensor]]:
+        """
+        Args:
+            cell_emb: Tensor, shape (batch, embsize=d_model)
+            gene_embs: Tensor, shape (batch, seq_len, embsize=d_model)
+        """
+        gene_embs = gene_embs.detach() if self.do_detach else gene_embs
+        if self.arch_style in ["inner product", "inner product, detach"]:
+            query_vecs = self.query_activation(self.gene2query(gene_embs))
+            cell_emb = cell_emb.unsqueeze(2)  # (batch, embsize, 1)
+            # the pred gene expr values, # (batch, seq_len)
+            pred_value = torch.bmm(self.W(query_vecs), cell_emb).squeeze(2)
+            if not self.explicit_zero_prob:
+                return dict(pred=pred_value)
+            # zero logits need to based on the cell_emb, because of input exprs
+            zero_logits = torch.bmm(self.W_zero_logit(query_vecs), cell_emb).squeeze(2)
+            zero_probs = torch.sigmoid(zero_logits)
+            return dict(pred=pred_value, zero_probs=zero_probs)
+        elif self.arch_style == "concat query":
+            query_vecs = self.query_activation(self.gene2query(gene_embs))
+            # expand cell_emb to (batch, seq_len, embsize)
+            cell_emb = cell_emb.unsqueeze(1).expand(-1, gene_embs.shape[1], -1)
+
+            h = self.hidden_activation(
+                self.fc1(torch.cat([cell_emb, query_vecs], dim=2))
+            )
+            if self.explicit_zero_prob:
+                raise NotImplementedError
+            return self.fc2(h).squeeze(2)  # (batch, seq_len)
+        elif self.arch_style == "sum query":
+            query_vecs = self.query_activation(self.gene2query(gene_embs))
+            cell_emb = cell_emb.unsqueeze(1)
+
+            h = self.hidden_activation(self.fc1(cell_emb + query_vecs))
+            if self.explicit_zero_prob:
+                raise NotImplementedError
+            return self.fc2(h).squeeze(2)  # (batch, seq_len)
+
+
+class AdversarialDiscriminator(nn.Module):
+    """
+    Discriminator for the adversarial training for batch correction.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_cls: int,
+        nlayers: int = 3,
+        activation: callable = nn.LeakyReLU,
+        reverse_grad: bool = False,
+    ):
+        super().__init__()
+        # module list
+        self._decoder = nn.ModuleList()
+        for i in range(nlayers - 1):
+            self._decoder.append(nn.Linear(d_model, d_model))
+            self._decoder.append(activation())
+            self._decoder.append(nn.LayerNorm(d_model))
+        self.out_layer = nn.Linear(d_model, n_cls)
+        self.reverse_grad = reverse_grad
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: Tensor, shape [batch_size, embsize]
+        """
+        if self.reverse_grad:
+            x = grad_reverse(x, lambd=1.0)
+        for layer in self._decoder:
+            x = layer(x)
+        return self.out_layer(x)
+
+
+
+
+
