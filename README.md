@@ -101,14 +101,13 @@ Results will be saved in `../results_finetune/PROXIMA_Imputation_{TaskName}/{tim
 - `best_model_imputation.pt`: The fine-tuned model optimized for reconstruction.
 - Logs displaying the Validation Loss and Validation MAE.
 
-## Model Availability
-Pre-trained PROXIMA weights trained on the comprehensive pre-training dataset are available on Zenodo: [https://doi.org/10.5281/zenodo.xxxxxx](https://doi.org/10.5281/zenodo.xxxxxx). You can download these weights to fine-tune on your own datasets and downstream tasks.
-
-## Data Availability
-Due to space limitations, we provide **Demo Datasets** in the `./Data` directory for pre-training and downstream tasks.
+## Data & Model Availability
+Due to storage limitations, we provide a Demo Dataset for pre-training and downstream tasks, which is available on Zenodo: [https://doi.org/10.5281/zenodo.18501404]. Please place files in the `./Data` directory for pre-training and downstream tasks.
 
 The Pre-training dataset was constructed using data sourced from the [Aquila database](https://aquila.cheunglab.org/) and additional datasets accessible at Zenodo (DOI: [10.5281/zenodo.10067009](https://doi.org/10.5281/zenodo.10067009)).
-The complete, processed pre-training dataset will be made publicly available upon publication.
+The complete, processed pre-training dataset and the associated pre-trained PROXIMA weights will be made publicly available upon publication.
+
+
 
 
 
