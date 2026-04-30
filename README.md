@@ -101,11 +101,38 @@ Results will be saved in `../results_finetune/PROXIMA_Imputation_{TaskName}/{tim
 - `best_model_imputation.pt`: The fine-tuned model optimized for reconstruction.
 - Logs displaying the Validation Loss and Validation MAE.
 
-## Data & Model Availability
-Due to storage limitations, we provide a Demo Dataset for pre-training and downstream tasks, which is available on Zenodo: [https://doi.org/10.5281/zenodo.18501404]. Please place files in the `./Data` directory for pre-training and downstream tasks.
+## 4. Fine-tuning: Clustering
+This task fine-tunes PROXIMA to produce batch-aware cell embeddings that capture cell identity, enabling high-quality unsupervised cell clustering.
 
-The Pre-training dataset was constructed using data sourced from the [Aquila database](https://aquila.cheunglab.org/) and additional datasets accessible at Zenodo (DOI: [10.5281/zenodo.10067009](https://doi.org/10.5281/zenodo.10067009)).
-The complete, processed pre-training dataset and the associated pre-trained PROXIMA weights will be made publicly available upon publication.
+### Configuration
+Before running the clustering task, first prepare the dataset using the provided notebook, then update the pre-trained model path in the script.
+
+**Step 1 — Prepare data.** Open and run `prepare_clustering_data.ipynb` interactively in JupyterLab / VS Code to subsample and split your h5ad file into train and test sets. Alternatively, execute it from the command line:
+```bash
+jupyter nbconvert --to notebook --execute prepare_clustering_data.ipynb
+```
+
+**Step 2 — Update config.** Open `finetuning_clustering.py` and replace `pretrained_model_path` with the path to your pre-trained checkpoint (e.g., `../Results/PROXIMA_Pretraining/XXXXXXXX_XXXXXX/best_model.pt`).
+
+### Running the Script
+```bash
+python finetuning_clustering.py
+```
+
+### Time cost
+Expected run time for demo on a "normal" desktop computer is about 20 minutes. This duration may vary depending on the hardware specifications and the size of the dataset.
+
+### Expected Output
+Results will be saved in `../Results_finetune/PROXIMA_Clustering/{timestamp}`:
+- `best_model_clustering.pt`: The fine-tuned model weights achieving the best validation ASW.
+- `test_metrics.csv`: Final evaluation metrics on the test set (ASW, ARI, NMI, Purity Score).
+- `test_embeddings.npy`: Cell embeddings extracted from the best model for downstream analysis.
+
+## Data & Model Availability
+The **Demo Dataset** and **pre-trained PROXIMA weights** are available on Zenodo: [https://doi.org/10.5281/zenodo.18501404](https://doi.org/10.5281/zenodo.18501404). Please place the demo data files in the `./Data` directory before running fine-tuning scripts.
+
+The pre-training dataset was constructed using data sourced from the [Aquila database](https://aquila.cheunglab.org/) and additional datasets accessible at Zenodo (DOI: [10.5281/zenodo.10067009](https://doi.org/10.5281/zenodo.10067009)).
+The complete, processed pre-training dataset will be made publicly available upon publication.
 
 
 
