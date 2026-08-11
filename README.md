@@ -104,15 +104,10 @@ Results will be saved in `../results_finetune/PROXIMA_Imputation_{TaskName}/{tim
 ## 4. Fine-tuning: Clustering
 This task fine-tunes PROXIMA to produce batch-aware cell embeddings that capture cell identity, enabling high-quality unsupervised cell clustering.
 
+
 ### Configuration
-Before running the clustering task, first prepare the dataset using the provided notebook, then update the pre-trained model path in the script.
-
-**Step 1 — Prepare data.** Open and run `prepare_clustering_data.ipynb` interactively in JupyterLab / VS Code to subsample and split your h5ad file into train and test sets. Alternatively, execute it from the command line:
-```bash
-jupyter nbconvert --to notebook --execute prepare_clustering_data.ipynb
-```
-
-**Step 2 — Update config.** Open `finetuning_clustering.py` and replace `pretrained_model_path` with the path to your pre-trained checkpoint (e.g., `../Results/PROXIMA_Pretraining/XXXXXXXX_XXXXXX/best_model.pt`).
+Open `finetuning_clustering.py` and replace `pretrained_model_path` with the path to your
+pre-trained checkpoint (e.g., `../Results/PROXIMA_Pretraining/XXXXXXXX_XXXXXX/best_model.pt`).
 
 ### Running the Script
 ```bash
