@@ -39,7 +39,7 @@ class ImputationConfig:
     
     # Paths
     train_val_h5ad_path = "../Data/finetuning_data/Demo_data.h5ad"
-    pretrained_model_path = "../Results/PROXIMA_Pretraining/20260108_142617/best_model.pt"
+    pretrained_model_path = "../Results/PROXIMA_Pretraining/XXXXXXXX_XXXXXX/best_model.pt"
     vocab_path = "./Vocab/vocab.json"
     esm_embeddings_path = './Embedding/embeddings.npy'
     

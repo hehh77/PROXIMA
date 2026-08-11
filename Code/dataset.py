@@ -454,3 +454,186 @@ def imputation_collate_fn(batch, config, vocab):
         "expressions_masked_input": expressions_masked_input_with_cls,
         "imputation_eval_mask": imputation_eval_mask_with_cls,
     }
+
+
+def prepare_clustering_data(config):
+    """
+    Loads and preprocesses data for Clustering / Batch Correction tasks.
+    """
+    print("--- Loading and Preprocessing Data for Clustering ---")
+    adata_train_val = sc.read_h5ad(config.train_val_h5ad_path)
+    adata_test = sc.read_h5ad(config.test_h5ad_path)
+
+    # Verify required columns
+    for adata, name in [(adata_train_val, "Train/Val"), (adata_test, "Test")]:
+        if config.cell_type_key not in adata.obs.columns:
+            raise ValueError(f"Key '{config.cell_type_key}' not found in {name} .obs")
+        if config.batch_key not in adata.obs.columns:
+            raise ValueError(f"Key '{config.batch_key}' not found in {name} .obs")
+
+    # Load Vocab
+    from Src.tokenizer import GeneVocab
+    vocab = GeneVocab.from_file(config.vocab_path)
+    for s in config.special_tokens:
+        if s not in vocab:
+            vocab.append_token(s)
+
+    # Filter genes based on vocab
+    processed_adatas = []
+    for adata in [adata_train_val, adata_test]:
+        adata.var["id_in_vocab"] = [vocab[g] if g in vocab else -1 for g in adata.var.index]
+        genes_in_vocab_mask = adata.var["id_in_vocab"] >= 0
+        adata = adata[:, genes_in_vocab_mask].copy()
+        processed_adatas.append(adata)
+
+    adata_train_val, adata_test = processed_adatas
+    gc.collect()
+
+    # Create integer batch labels using a unified mapping across train/val and test
+    all_batches = pd.concat([
+        adata_train_val.obs[config.batch_key],
+        adata_test.obs[config.batch_key]
+    ]).unique()
+    batch_map = {name: i for i, name in enumerate(all_batches)}
+
+    adata_train_val.obs["batch_id"] = adata_train_val.obs[config.batch_key].map(batch_map).astype(int)
+    adata_test.obs["batch_id"] = adata_test.obs[config.batch_key].map(batch_map).astype(int)
+    config.num_batch_labels = len(batch_map)
+
+    # Split Train/Val
+    np.random.seed(config.seed)
+    indices = np.random.permutation(adata_train_val.n_obs)
+    val_size = int(adata_train_val.n_obs * config.validation_split)
+    val_idx, train_idx = indices[:val_size], indices[val_size:]
+
+    print(f"  Cells (train/val): {adata_train_val.n_obs} ({len(train_idx)} train, {len(val_idx)} val)")
+    print(f"  Cells (test): {adata_test.n_obs} | Batches: {config.num_batch_labels}")
+    print("--- Data Preprocessing Complete ---")
+
+    return adata_train_val, adata_test, train_idx, val_idx, vocab
+
+
+class ClusteringDataset(Dataset):
+    """
+    Dataset for unsupervised cell clustering / batch correction fine-tuning.
+    Returns sparse expression profiles (nonzero tokens only) with CLS token prepended.
+    """
+    def __init__(self, adata: sc.AnnData, indices: np.ndarray, vocab, config):
+        self.adata = adata
+        self.indices = indices
+        self.vocab = vocab
+        self.config = config
+
+        self.expression_matrix = adata.X.tocsr() if hasattr(adata.X, 'tocsr') else adata.X
+        self.gene_ids_in_vocab = torch.tensor(adata.var["id_in_vocab"].values, dtype=torch.long)
+        self.batch_ids = torch.tensor(adata.obs["batch_id"].values, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        cell_abs_idx = self.indices[idx]
+        row_expr = self.expression_matrix[cell_abs_idx]
+        if hasattr(row_expr, 'toarray'):
+            row_expr = row_expr.toarray().flatten()
+
+        row_expr = torch.from_numpy(row_expr).float()
+        nonzero_indices = torch.nonzero(row_expr, as_tuple=True)[0]
+
+        genes = self.gene_ids_in_vocab[nonzero_indices]
+        expressions = row_expr[nonzero_indices]
+
+        # Prepend CLS token
+        genes = torch.cat([torch.tensor([self.vocab[self.config.cls_token]]), genes])
+        expressions = torch.cat([torch.tensor([self.config.pad_value]), expressions])
+
+        return {
+            "genes": genes,
+            "expressions": expressions,
+            "batch_labels": self.batch_ids[cell_abs_idx],
+        }
+
+
+def clustering_collate_fn(batch, config, vocab):
+    """
+    Collate function for clustering training (random truncation + MEP masking).
+    """
+    genes_list = [item['genes'] for item in batch]
+    expr_list = [item['expressions'] for item in batch]
+    batch_labels_list = [item['batch_labels'] for item in batch]
+
+    # Random truncation
+    for i in range(len(genes_list)):
+        if len(genes_list[i]) > config.max_length:
+            cls_gene, cls_expr = genes_list[i][0], expr_list[i][0]
+            indices = torch.randperm(len(genes_list[i]) - 1)[:config.max_length - 1] + 1
+            genes_list[i] = torch.cat([cls_gene.unsqueeze(0), genes_list[i][indices]])
+            expr_list[i] = torch.cat([cls_expr.unsqueeze(0), expr_list[i][indices]])
+
+    # Padding
+    current_max_len = max(len(g) for g in genes_list)
+    padded_genes_list, padded_expr_list = [], []
+    for i in range(len(genes_list)):
+        pad_len = current_max_len - len(genes_list[i])
+        genes_padded = torch.cat([genes_list[i], torch.full((pad_len,), vocab[config.pad_token], dtype=torch.long)])
+        expr_padded = torch.cat([expr_list[i], torch.full((pad_len,), config.pad_value, dtype=torch.float32)])
+        padded_genes_list.append(genes_padded)
+        padded_expr_list.append(expr_padded)
+
+    genes_tensor = torch.stack(padded_genes_list)
+    expressions_tensor = torch.stack(padded_expr_list)
+    batch_labels_tensor = torch.stack(batch_labels_list)
+
+    # MEP (Masked Expression Prediction) masking
+    masked_expressions = expressions_tensor.clone()
+    prob_matrix = torch.full(masked_expressions.shape, 0.15)
+    prob_matrix[:, 0] = 0  # Do not mask CLS
+    prob_matrix[genes_tensor == vocab[config.pad_token]] = 0  # Do not mask PAD
+    mlm_mask = torch.bernoulli(prob_matrix).bool()
+    masked_expressions[mlm_mask] = config.mask_value
+
+    return {
+        "genes": genes_tensor,
+        "expressions_truth": expressions_tensor,
+        "expressions_masked": masked_expressions,
+        "mlm_mask": mlm_mask,
+        "batch_labels": batch_labels_tensor,
+    }
+
+
+def clustering_eval_collate_fn(batch, config, vocab):
+    """
+    Collate function for clustering evaluation (deterministic truncation, no masking).
+    """
+    genes_list = [item['genes'] for item in batch]
+    expr_list = [item['expressions'] for item in batch]
+    batch_labels_list = [item['batch_labels'] for item in batch]
+
+    # Deterministic truncation
+    for i in range(len(genes_list)):
+        if len(genes_list[i]) > config.max_length:
+            cls_gene, cls_expr = genes_list[i][0], expr_list[i][0]
+            genes_list[i] = torch.cat([cls_gene.unsqueeze(0), genes_list[i][1:config.max_length]])
+            expr_list[i] = torch.cat([cls_expr.unsqueeze(0), expr_list[i][1:config.max_length]])
+
+    # Padding
+    current_max_len = max(len(g) for g in genes_list)
+    padded_genes_list, padded_expr_list = [], []
+    for i in range(len(genes_list)):
+        pad_len = current_max_len - len(genes_list[i])
+        genes_padded = torch.cat([genes_list[i], torch.full((pad_len,), vocab[config.pad_token], dtype=torch.long)])
+        expr_padded = torch.cat([expr_list[i], torch.full((pad_len,), config.pad_value, dtype=torch.float32)])
+        padded_genes_list.append(genes_padded)
+        padded_expr_list.append(expr_padded)
+
+    genes_tensor = torch.stack(padded_genes_list)
+    expressions_tensor = torch.stack(padded_expr_list)
+    batch_labels_tensor = torch.stack(batch_labels_list)
+
+    return {
+        "genes": genes_tensor,
+        "expressions_truth": expressions_tensor,
+        "expressions_masked": expressions_tensor.clone(),  # No masking for eval
+        "mlm_mask": torch.zeros_like(expressions_tensor, dtype=torch.bool),
+        "batch_labels": batch_labels_tensor,
+    }
