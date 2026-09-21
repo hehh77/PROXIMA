@@ -1,6 +1,6 @@
 # PROXIMA
 
-## A microenvironment-aware foundation model for single-cell spatial proteomics
+## A microenvironment-aware foundation model for virtual tissue modeling from single-cell spatial proteomics
 
 ![Alt text](./fig1.png "PROXIMA Framework")
 
