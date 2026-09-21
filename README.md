@@ -124,7 +124,7 @@ Results will be saved in `../Results_finetune/PROXIMA_Clustering/{timestamp}`:
 - `test_embeddings.npy`: Cell embeddings extracted from the best model for downstream analysis.
 
 ## Data & Model Availability
-The **Demo Dataset** and **pre-trained PROXIMA weights** are available on Zenodo: [https://doi.org/10.5281/zenodo.18501404](https://doi.org/10.5281/zenodo.18501404). Please place the demo data files in the `./Data` directory before running fine-tuning scripts.
+The **Demo Dataset** and **pre-trained PROXIMA weights** are available on Zenodo: [https://doi.org/10.5281/zenodo.19908874](https://doi.org/10.5281/zenodo.19908874). Please place the demo data files in the `./Data` directory before running fine-tuning scripts.
 
 The pre-training dataset was constructed using data sourced from the [Aquila database](https://aquila.cheunglab.org/) and additional datasets accessible at Zenodo (DOI: [10.5281/zenodo.10067009](https://doi.org/10.5281/zenodo.10067009)).
 The complete, processed pre-training dataset will be made publicly available upon publication.
