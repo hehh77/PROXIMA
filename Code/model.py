@@ -93,16 +93,13 @@ class TransformerModel_add_embedding(nn.Module):
         if self.use_esm_features:
             esm_embedding_dim = esm_embedding_matrix.shape[1]
             
-            # 1. 创建专用的、冻结的ESM嵌入层
             self.esm_encoder = nn.Embedding.from_pretrained(
                 esm_embedding_matrix, 
                 freeze=freeze_esm
             )
             
-            # 2. 创建一个专门用于ESM嵌入的LayerNorm层
             self.esm_norm = nn.LayerNorm(esm_embedding_dim)
             
-            # 3. 创建融合层
             self.fusion_layer = nn.Linear(d_model + esm_embedding_dim, d_model)
             self.fusion_norm = nn.LayerNorm(d_model)
 
@@ -216,14 +213,11 @@ class TransformerModel_add_embedding(nn.Module):
         self.cur_gene_token_embs = src_emb
 
         if self.use_esm_features:
-            # 2. 获取ESM嵌入，并对其进行LayerNorm
             esm_emb = self.esm_encoder(src)
-            esm_emb = self.esm_norm(esm_emb) # <<< 关键步骤：对ESM嵌入进行层归一化
+            esm_emb = self.esm_norm(esm_emb) 
             
-            # 3. 拼接两种已经归一化过的嵌入
             concatenated_emb = torch.cat([src_emb, esm_emb], dim=-1)
             
-            # 4. 通过融合层进行投影和最终的归一化
             fused_emb = self.fusion_layer(concatenated_emb)
             fused_emb = self.fusion_norm(fused_emb)
         else:
@@ -234,9 +228,9 @@ class TransformerModel_add_embedding(nn.Module):
         values = self.value_encoder(values)  # (batch, seq_len, embsize)
         if self.input_emb_style == "scaling":
             values = values.unsqueeze(2)
-            total_embs = src_emb * values
+            total_embs = fused_emb * values
         else:
-            total_embs = src_emb + values
+            total_embs = fused_emb + values
 
         output = self.transformer_encoder(
             total_embs, src_key_padding_mask=src_key_padding_mask
